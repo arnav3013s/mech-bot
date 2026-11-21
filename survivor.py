@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sys
+import time
 from array import array
 
 import mechfight as mf
@@ -34,9 +35,11 @@ def wrap(a):
 
 
 class World:
+    _polygon_cache = {}
     def __init__(self, mapdir, files):
         self.ok = False
         self.solids = {}
+        self.deadline = math.inf
         self.mech_radius, self.mech_height, self.step_up = 2.5, 9, 1.2
         try:
             with open(os.path.join(mapdir, "v2/world.json")) as source:
@@ -57,6 +60,9 @@ class World:
                 ring = list(zip(p['ring'][::2],p['ring'][1::2]))
                 holes = [list(zip(h[::2],h[1::2])) for h in p.get('holes',[]) if h]
                 entry = (p['base'],p['top'],ring,holes)
+                self._inside(ring,0,0)
+                for hole in holes:
+                    self._inside(hole,0,0)
                 for bx in range(math.floor(min(x for x,y in ring)/32),math.floor(max(x for x,y in ring)/32)+1):
                     for by in range(math.floor(min(y for x,y in ring)/32),math.floor(max(y for x,y in ring)/32)+1):
                         self.solids.setdefault((bx,by),[]).append(entry)
@@ -82,15 +88,31 @@ class World:
 
     @staticmethod
     def _inside(pts, x, y):
+        # Static polygons are indexed into horizontal bands once. A point query
+        # only needs edges that cross its own band, even for a complex stadium.
+        key = id(pts)
+        cached = World._polygon_cache.get(key)
+        if cached is None:
+            if not pts:
+                return False
+            bounds = (min(p[0] for p in pts),max(p[0] for p in pts),
+                      min(p[1] for p in pts),max(p[1] for p in pts))
+            bands = {}
+            for i,(xi,yi) in enumerate(pts):
+                xj,yj = pts[(i+1)%len(pts)]
+                if yi==yj:
+                    continue
+                for band in range(math.floor(min(yi,yj)/8),math.floor(max(yi,yj)/8)+1):
+                    bands.setdefault(band,[]).append((xi,yi,xj,yj))
+            # Retain the polygon so its identity cannot be reused by a new one.
+            cached = World._polygon_cache[key] = (pts,bounds,bands)
+        _,bounds,bands = cached
+        if x<bounds[0] or x>bounds[1] or y<bounds[2] or y>bounds[3]:
+            return False
         c = False
-        n = len(pts)
-        j = n - 1
-        for i in range(n):
-            xi, yi = pts[i]
-            xj, yj = pts[j]
+        for xi,yi,xj,yj in bands.get(math.floor(y/8),()):
             if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi:
                 c = not c
-            j = i
         return c
 
     def solid_at(self, x, y, low, high):
@@ -106,31 +128,108 @@ class World:
         x,y,z = pos
         height = self.mech_height
         radius = self.mech_radius
-        for d in range(2,int(maxd)+1,2):
+        previous_floor = z
+        previous_terrain = self.ground(x,y)
+        slope_limit = math.tan(math.radians(getattr(self,'max_slope',50)))
+        for sample in range(1, int(maxd*2)+1):
+            d = sample*0.5
+            if time.perf_counter()>=self.deadline:
+                return max(0,d-0.5)
             px,py = x+dx*d,y+dy*d
             # A roof remains walkable while its top is beneath the feet.
             floor = self.ground(px,py)
             for base, top, ring, holes in self.solids.get((math.floor(px/32),math.floor(py/32)), ()):
-                if top <= z+self.step_up and top>floor and self._inside(ring,px,py) and not any(self._inside(h,px,py) for h in holes):
+                if top <= previous_floor+self.step_up and top>floor and self._inside(ring,px,py) and not any(self._inside(h,px,py) for h in holes):
                     floor = top
-            if floor > z+self.step_up or floor < z-3:
-                return max(0,d-2)
+            terrain = self.ground(px,py)
+            steep = terrain > previous_terrain + 0.5*slope_limit + 1e-6
+            if floor > previous_floor+self.step_up or floor < previous_floor-3 or (steep and floor==terrain):
+                return max(0,d-0.5)
             if not self.minx+radius<px<self.maxx-radius or not self.miny+radius<py<self.maxy-radius:
-                return max(0,d-2)
+                return max(0,d-0.5)
             for ox,oy in ((0,0),(radius,0),(-radius,0),(0,radius),(0,-radius)):
-                if self.solid_at(px+ox,py+oy,z+self.step_up,z+height):
-                    return max(0,d-2)
+                if self.solid_at(px+ox,py+oy,floor+self.step_up,floor+height):
+                    return max(0,d-0.5)
+            previous_floor, previous_terrain = floor, terrain
         return maxd
+
+    def air_clear(self, pos, dx, dy, maxd=18):
+        if not self.ok:
+            return maxd
+        x,y,z = pos
+        radius = self.mech_radius
+        for sample in range(1,int(maxd*2)+1):
+            distance = sample*0.5
+            if time.perf_counter()>=self.deadline:
+                return max(0,distance-0.5)
+            px,py = x+dx*distance,y+dy*distance
+            if not self.minx+radius<px<self.maxx-radius or not self.miny+radius<py<self.maxy-radius:
+                return max(0,distance-0.5)
+            for ox,oy in ((0,0),(radius,0),(-radius,0),(0,radius),(0,-radius)):
+                if self.ground(px+ox,py+oy)>z+self.step_up or self.solid_at(px+ox,py+oy,z+0.1,z+self.mech_height):
+                    return max(0,distance-0.5)
+        return maxd
+
+    @staticmethod
+    def segment_hits_solid(a, b, solid):
+        base,top,ring,holes = solid
+        dz = b[2]-a[2]
+        low,high = 0.0,1.0
+        if abs(dz)<1e-10:
+            if not base<=a[2]<=top:
+                return False
+        else:
+            enter,leave = sorted(((base-a[2])/dz,(top-a[2])/dz))
+            low,high = max(low,enter),min(high,leave)
+            if low>high:
+                return False
+        dx,dy = b[0]-a[0],b[1]-a[1]
+        cuts = [low,high]
+        for polygon in (ring,*holes):
+            for i, (x1,y1) in enumerate(polygon):
+                x2,y2 = polygon[(i+1)%len(polygon)]
+                ex,ey = x2-x1,y2-y1
+                cross = dx*ey-dy*ex
+                if abs(cross)<1e-10:
+                    continue
+                rx,ry = x1-a[0],y1-a[1]
+                t = (rx*ey-ry*ex)/cross
+                u = (rx*dy-ry*dx)/cross
+                if low<=t<=high and 0<=u<=1:
+                    cuts.append(t)
+        cuts.sort()
+        probes = cuts + [(left+right)/2 for left,right in zip(cuts,cuts[1:])]
+        for t in probes:
+            x,y = a[0]+dx*t,a[1]+dy*t
+            if World._inside(ring,x,y) and not any(World._inside(h,x,y) for h in holes):
+                return True
+        return False
 
     def los(self, a, b):
         if not self.ok:
             return False
+        if time.perf_counter()>=self.deadline:
+            return False
         length = math.dist(a,b)
-        samples = max(1,math.ceil(length/2))
+        # Intersect complete polygon segments so thin walls cannot fall between ray samples.
+        checked = set()
+        for bx in range(math.floor(min(a[0],b[0])/32),math.floor(max(a[0],b[0])/32)+1):
+            for by in range(math.floor(min(a[1],b[1])/32),math.floor(max(a[1],b[1])/32)+1):
+                for solid in self.solids.get((bx,by),()):
+                    if time.perf_counter()>=self.deadline:
+                        return False
+                    identity = id(solid)
+                    if identity not in checked:
+                        checked.add(identity)
+                        if self.segment_hits_solid(a,b,solid):
+                            return False
+        samples = max(1,math.ceil(length/0.5))
         for step in range(1,samples):
+            if step%16==0 and time.perf_counter()>=self.deadline:
+                return False
             f = step/samples
             x,y,z = (a[i]+(b[i]-a[i])*f for i in range(3))
-            if self.ground(x,y)>z or self.solid_at(x,y,z-0.01,z+0.01):
+            if self.ground(x,y)>z:
                 return False
         return True
 
@@ -154,6 +253,8 @@ class Bot:
         self.loot_since = -1
         self.avoid_loot = {}
         self.previous_move = [0, 0]
+        self.grounded = True
+        self.cover_threat = None
 
     def steer(self, pos, desired, zone, urgent):
         x, y, z = pos
@@ -165,9 +266,12 @@ class Bot:
         current = math.hypot(x-zone['center'][0], y-zone['center'][1])
         # Ground steering uses the mech's current elevation, including roof surfaces.
         for offset, alignment in _STEER_OFFSETS:
+            if time.perf_counter()>=self.world.deadline:
+                break
             angle = heading + offset
             dx, dy = math.cos(angle), math.sin(angle)
-            clear = self.world.walk_clear(pos, dx, dy, 18)
+            clear = (self.world.walk_clear(pos, dx, dy, 10) if self.grounded
+                     else self.world.air_clear(pos, dx, dy, 10))
             if clear < 1:
                 continue
             travel = min(10.0, clear)
@@ -183,6 +287,9 @@ class Bot:
                 score += 0.8*self.side*math.sin(offset)
             if score > best_score:
                 best_score, best = score, [dx*min(1.0,length), dy*min(1.0,length)]
+            if offset==0 and clear>=10 and self.stuck<5:
+                # An unobstructed desired route needs no alternative-ray search.
+                break
         return best
 
     def target_point(self, enemy, flight=0):
@@ -238,12 +345,15 @@ class Bot:
         return best
 
     def act(self, obs):
+        self.world.deadline = time.perf_counter()+0.020
         me, now = obs['self'], obs['t']
         x,y,z = me['pos']
         stats = me['stats']
         self.world.mech_radius = stats.get('radius',2.5)
         self.world.mech_height = stats.get('height',9)
         self.world.step_up = stats.get('step_up',1.2)
+        self.world.max_slope = stats.get('max_slope_deg',50)
+        self.grounded = me['grounded']
         weapons = me['weapons']
         action = {'tick':obs['tick'], 'jump':False, 'fire':[False,False]}
         if obs.get('offer'):
@@ -295,11 +405,26 @@ class Bot:
             want[0] += -self.side*dy/d + radial*dx/d
             want[1] += self.side*dx/d + radial*dy/d
             # Stay mobile while choosing actual geometry that screens opponents.
-            if self.world.ok and me['grounded'] and now>=self.cover_until:
+            current_threat = (threat['id'],tuple(threat['pos']))
+            flanked = (self.cover_threat is not None and
+                       (current_threat[0]!=self.cover_threat[0] or
+                        math.dist(current_threat[1],self.cover_threat[1])>3))
+            if self.cover_goal:
+                nx,ny = self.cover_goal
+                point = (nx,ny,z+stats.get('muzzle_height',7))
+                exposed = any(self.world.los((e['pos'][0],e['pos'][1],e['pos'][2]+7),point) for e in enemies[:2])
+                if flanked or exposed or math.dist((nx,ny),zone['center'])>zone['radius']-margin:
+                    self.cover_goal = None
+                    self.cover_until = -1
+            if self.world.ok and me['grounded'] and (flanked or now>=self.cover_until):
+                self.cover_threat = current_threat
                 self.cover_until = now+0.5
                 self.cover_goal = None
                 best = -math.inf
+                planning_deadline = min(self.world.deadline,time.perf_counter()+0.004)
                 for offset in (0.6,-0.6,1.2,-1.2,1.8,-1.8):
+                    if time.perf_counter()>=planning_deadline:
+                        break
                     angle = math.atan2(-dy,-dx)+offset
                     ux,uy = math.cos(angle),math.sin(angle)
                     reach = min(14,self.world.walk_clear(me['pos'],ux,uy,17))
@@ -393,7 +518,7 @@ class Bot:
             direct = self.target_point(target)
             aim = self.aim_at(origin,gun_point)
             laser = next((w for w in weapons if w and w['kind']=='laser'),None)
-            laser_active = laser and (laser.get('charge',0)>0 or laser.get('cooldown',0)<=0)
+            laser_active = laser and not urgent and (laser.get('charge',0)>0 or laser.get('cooldown',0)<=0)
             if laser_active:
                 aim = self.aim_at(origin,direct)
             for slot,weapon in enumerate(weapons):
@@ -405,7 +530,7 @@ class Bot:
                 d = math.dist(origin,point)
                 clear = self.world.los(origin,point)
                 if kind=='gun':
-                    action['fire'][slot] = bool(weapon.get('ammo',0)>0 and weapon.get('reload',0)<=0
+                    action['fire'][slot] = bool(weapon.get('ammo',0)>0 and weapon.get('reload',0)<=0 and weapon.get('cooldown',0)<=0.05
                         and d<=spec['range'] and clear and self.aligned(me['aim'],desired,d))
                 elif kind=='lightning':
                     action['fire'][slot] = bool(d<=spec['range'] and clear and me['energy']>=spec['energy']
@@ -413,14 +538,24 @@ class Bot:
                 elif kind=='laser':
                     charge = weapon.get('charge',0)
                     aligned = self.aligned(me['aim'],desired,d)
-                    if charge>0:
+                    if urgent:
+                        # Releasing a charge is mandatory to regain full escape speed.
+                        action['fire'][slot] = False
+                    elif charge>0:
                         action['fire'][slot] = not (aligned and clear and charge>=spec['charge']*0.9)
                     else:
                         action['fire'][slot] = bool(weapon.get('cooldown',0)<=0 and d<=spec['range'] and clear
                                                    and self.aligned(me['aim'],desired,d,4,4))
         else:
             aim[0] = self.source if self.source is not None else wrap(aim[0]+0.35)
-            # Releasing an already charged laser necessarily discharges it under game rules.
+            charged = next((w for w in weapons if w and w['kind']=='laser' and w.get('charge',0)>0),None)
+            if charged:
+                # The protocol has no cancel. Slew toward nearby ground before releasing,
+                # keeping the old yaw instead of sweeping a charged beam across the arena.
+                aim = [me['aim'][0],stats.get('min_pitch',-0.7)]
+                for slot,weapon in enumerate(weapons):
+                    if weapon is charged:
+                        action['fire'][slot] = bool(not urgent and abs(me['aim'][1]-aim[1])>0.08)
         aim[1] = max(stats.get('min_pitch',-0.7),min(stats.get('max_pitch',1.3),aim[1]))
         action['aim'] = aim
         for weapon in weapons:
