@@ -11,15 +11,29 @@ from array import array
 import mechfight as mf
 
 CELL = 2.0
-UPG_PREF = ["armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "gyros", "gun_mag",
-            "laser_damage", "laser_charge", "sensors", "gun_velocity", "capacitor", "reactor", "jets"]
+UPG_RANK = {
+    "armor": 0, "plating": 1, "nanites": 2, "gun_damage": 3, "gun_rate": 4,
+    "servos": 5, "gyros": 6, "gun_mag": 7, "laser_damage": 8,
+    "laser_charge": 9, "sensors": 10, "gun_velocity": 11, "capacitor": 12,
+    "reactor": 13, "jets": 14,
+}
+_PI = math.pi
+_TAU = 2.0 * _PI
+_STEER_OFFSETS = tuple(
+    (offset, math.cos(offset))
+    for offset in (
+        k * _PI / 8.0 - (_TAU if k * _PI / 8.0 > _PI else 0.0)
+        for k in range(16)
+    )
+)
 
 
 def wrap(a):
-    while a > math.pi:
-        a -= 2 * math.pi
-    while a < -math.pi:
-        a += 2 * math.pi
+    # All callers pass differences in [-2π, 2π], so one correction is enough.
+    if a > _PI:
+        a -= _TAU
+    elif a < -_PI:
+        a += _TAU
     return a
 
 
@@ -134,10 +148,9 @@ class World:
         k = self.idx(x, y)
         return k < 0 or self.dil[k] == 1
 
-    def clear_dist(self, x, y, ang, maxd=30.0):
+    def clear_dist_xy(self, x, y, c, s, maxd=30.0):
         if not self.ok:
             return maxd
-        c, s = math.cos(ang), math.sin(ang)
         d = 3.0
         while d <= maxd:
             if self.blocked(x + c * d, y + s * d):
@@ -152,20 +165,22 @@ class World:
         dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
         dist = math.hypot(dx, dy)
         n = int(dist / 2.0)
-        for s in range(1, n):
-            f = s / n
-            x, y, z = a[0] + dx * f, a[1] + dy * f, a[2] + dz * f
-            k = self.idx(x, y)
+        if n <= 1:
+            return True
+        inv_n = 1.0 / n
+        ax, ay, az = a
+        for step in range(1, n):
+            f = step * inv_n
+            k = self.idx(ax + dx * f, ay + dy * f)
             if k < 0:
                 return False
-            if self.top[k] > z and self.top[k] > -1e8:
-                # raw ground-inside check: only count cells that are inside a prism
+            if self.top[k] > az + dz * f and self.top[k] > -1e8:
                 return False
         return True
 
 
 class Bot:
-    name = "survivor-py"
+    name = "CipherX-Duelist"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -204,18 +219,22 @@ class Bot:
         w = self.world
         if self.escape_until > t:
             da = self.escape_dir
-        best, bs = da, -1e9
-        for k in range(16):
-            a = da + wrap(k * math.pi / 8)
-            a = wrap(a)
-            cl = w.clear_dist(x, y, a)
-            diff = abs(wrap(a - da))
-            s = math.cos(diff) * 1.0 + min(cl, 30.0) / 30.0 * 0.5
+        best_c, best_s, bs = 0.0, 0.0, -1e9
+        for offset, alignment in _STEER_OFFSETS:
+            a = da + offset
+            if a > _PI:
+                a -= _TAU
+            elif a < -_PI:
+                a += _TAU
+            c, s = math.cos(a), math.sin(a)
+            cl = w.clear_dist_xy(x, y, c, s)
+            score = alignment * 1.0 + min(cl, 30.0) / 30.0 * 0.5
             if cl < 8.0:
-                s -= 2.0 * (8.0 - cl) / 8.0 + 0.5
-            if s > bs:
-                bs, best = s, a
-        return [math.cos(best) * min(1.0, mag), math.sin(best) * min(1.0, mag)]
+                score -= 2.0 * (8.0 - cl) * 0.125 + 0.5
+            if score > bs:
+                bs, best_c, best_s = score, c, s
+        scale = min(1.0, mag)
+        return [best_c * scale, best_s * scale]
 
     # ---------------------------------------------------------------- main
     def act(self, obs):
@@ -229,13 +248,12 @@ class Bot:
         # upgrade offer
         off = obs.get("offer")
         if off:
-            ids = [c["id"] for c in off["choices"]]
             pick = 0
-            bestr = 999
-            for i, cid in enumerate(ids):
-                r = UPG_PREF.index(cid) if cid in UPG_PREF else 500
-                if r < bestr:
-                    bestr, pick = r, i
+            best_rank = 999
+            for i, choice in enumerate(off["choices"]):
+                rank = UPG_RANK.get(choice["id"], 500)
+                if rank < best_rank:
+                    best_rank, pick = rank, i
             act["pick"] = pick
 
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
@@ -253,9 +271,14 @@ class Bot:
         # ------ targets
         muzzle = [x, y, z + stats.get("muzzle_height", 7)]
         target = None
+        gun, secondary = me["weapons"]
+        gun_range = gun["stats"].get("range", 230) if gun else 0
+        laser_range = secondary["stats"].get("range", 280) if secondary and secondary["kind"] == "laser" else 0
         for m in mechs:
+            if m["_d"] >= max(gun_range, laser_range) + 3:
+                break
             tp = m["pos"]
-            if m["_d"] < 230 and self.world.los(muzzle, [tp[0], tp[1], tp[2] + 4.5]):
+            if self.world.los(muzzle, [tp[0], tp[1], tp[2] + 4.5]):
                 target = m
                 break
         threat = mechs[0] if mechs else None
@@ -309,6 +332,12 @@ class Bot:
                         lx, ly = -math.sin(bear) * self.strafe, math.cos(bear) * self.strafe
                         want[0] += lx * 2.0
                         want[1] += ly * 2.0
+        # Keep moving during a ranged duel even when our zone goal is already satisfied.
+        if target is not None and not fighting and not urgent:
+            dx, dy = target["pos"][0] - x, target["pos"][1] - y
+            d = max(target["_d"], 0.01)
+            want[0] -= self.strafe * dy / d
+            want[1] += self.strafe * dx / d
         # npc avoidance
         for n in npcs:
             d = math.hypot(n["pos"][0] - x, n["pos"][1] - y)
@@ -406,30 +435,45 @@ class Bot:
         if target is not None:
             tp = target["pos"]
             tv = target["vel"]
-            gun = me["weapons"][0]
-            spdb = gun["stats"].get("speed", 252) if gun else 252
-            tt = 0.0
-            for _ in range(3):
-                aimp = [tp[0] + tv[0] * tt, tp[1] + tv[1] * tt, tp[2] + 4.5 + tv[2] * tt]
-                dist = math.dist(aimp[:2], (x, y)) + 1e-6
-                tt = dist / spdb + 0.05
-            yaw_cmd = math.atan2(aimp[1] - y, aimp[0] - x)
-            pit_cmd = max(-0.7, min(1.3, math.atan2(aimp[2] - muzzle[2], dist)))
-            err = abs(wrap(yaw_cmd - me["aim"][0]))
-            tol = 2.2 / dist + 0.02
-            if gun and gun.get("ammo", 1) > 0 and gun.get("reload", 0) <= 0 and dist < gun["stats"].get("range", 230) * 0.9 and err < tol:
-                fire[0] = True
-            w1 = me["weapons"][1]
-            if w1 and w1["kind"] == "lightning" and target["_d"] < 40 and err < 0.4 and me["energy"] > 10:
-                fire[1] = True
-            if w1 and w1["kind"] == "laser":
-                ch = w1.get("charge", 0)
-                full = w1["stats"].get("charge", 0.75)
-                if ch > 0:
-                    # releasing = firing; hold until nearly full unless aim is on target
-                    fire[1] = not (ch >= full * 0.9 or (ch >= 0.3 and err < tol * 1.5))
-                elif w1["cooldown"] <= 0.05 and dist < 150 and err < tol * 2.0:
-                    fire[1] = True
+            dx, dy = tp[0] - x, tp[1] - y
+            torso_height = 4.5 * (1 + self.cfg.get("cubes", {}).get("size_per_cube", 0.05) * target.get("cubes", 0))
+            dz = tp[2] + torso_height - muzzle[2]
+            speed = gun["stats"].get("speed", 252) if gun else 252
+            # Predict the intercept for the projectile gun. The laser uses current position.
+            travel = math.sqrt(dx*dx + dy*dy + dz*dz) / speed
+            for _ in range(2):
+                gx, gy, gz = dx + tv[0]*travel, dy + tv[1]*travel, dz + tv[2]*travel
+                gun_dist = math.sqrt(gx*gx + gy*gy + gz*gz)
+                travel = max(0.0, gun_dist - 3.0) / speed
+            gun_yaw = math.atan2(gy, gx)
+            gun_pitch = math.atan2(gz, math.hypot(gx, gy))
+            yaw_cmd, pit_cmd = gun_yaw, gun_pitch
+            aim_yaw, aim_pitch = me["aim"]
+            gun_tol = math.atan2(2.5, max(1, gun_dist))
+            pitch_tol = math.atan2(torso_height, max(1, gun_dist))
+            if gun and gun_dist <= gun_range + 3 and gun.get("ammo", 0) and gun.get("reload", 0) <= 0:
+                fire[0] = (abs(wrap(gun_yaw - aim_yaw)) < gun_tol + 0.015 and
+                           abs(gun_pitch - aim_pitch) < pitch_tol + 0.015)
+            direct_yaw = math.atan2(dy, dx)
+            direct_pitch = math.atan2(dz, max(0.01, target["_d"]))
+            direct_dist = math.hypot(target["_d"], dz)
+            if secondary:
+                spec = secondary["stats"]
+                if secondary["kind"] == "laser":
+                    charge = secondary.get("charge", 0.0)
+                    full = spec.get("charge", 0.75)
+                    ready = secondary["cooldown"] <= 0.05 and direct_dist <= laser_range
+                    # Start charging as the torso acquires the target. Release an aligned
+                    # shot at high charge, holding briefly if the target changes direction.
+                    if charge > 0 or (ready and abs(wrap(direct_yaw - aim_yaw)) < 0.35):
+                        yaw_cmd, pit_cmd = direct_yaw, direct_pitch
+                        lined_up = (abs(wrap(direct_yaw - aim_yaw)) < math.atan2(2.5, max(1, direct_dist))
+                                    and abs(direct_pitch - aim_pitch) < math.atan2(torso_height, max(1, direct_dist)))
+                        fire[1] = not (charge >= full * 0.9 and lined_up)
+                elif secondary["kind"] == "lightning":
+                    fire[1] = (direct_dist <= spec.get("range", 45) and
+                               abs(wrap(direct_yaw - aim_yaw)) < math.radians(spec.get("cone_deg", 30)) * 0.5
+                               and me["energy"] >= spec.get("energy", 3))
         else:
             if unseen_hit:
                 yaw_cmd = self.hit_bearing
