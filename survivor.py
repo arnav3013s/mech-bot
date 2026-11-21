@@ -191,8 +191,8 @@ class Bot:
         z = obs["zone"]
         t = obs["t"]
         cur_c, cur_r = z["center"], z["radius"]
-        if t >= z["shrink_start"] - 30:
-            return z["next_center"], z["next_radius"], cur_c, cur_r
+        # v1D: always head for the next circle (early rotation)
+        return z["next_center"], z["next_radius"], cur_c, cur_r
         return cur_c, cur_r, cur_c, cur_r
 
     def steer(self, x, y, want, t):
@@ -253,25 +253,11 @@ class Bot:
         # ------ targets
         muzzle = [x, y, z + stats.get("muzzle_height", 7)]
         target = None
-        seen_los = []
         for m in mechs:
             tp = m["pos"]
             if m["_d"] < 230 and self.world.los(muzzle, [tp[0], tp[1], tp[2] + 4.5]):
-                seen_los.append(m)
-        if seen_los:
-            def _threat(m):
-                s = 80.0 / max(m["_d"], 1.0)
-                if m.get("charging"):
-                    s += 8.0
-                ws = m.get("weapons", [])
-                if "laser" in ws:
-                    s += 6.0
-                if "lightning" in ws and m["_d"] < 50:
-                    s += 8.0
-                if "mortar" in ws:
-                    s += 3.0
-                return s
-            target = max(seen_los, key=_threat)
+                target = m
+                break
         threat = mechs[0] if mechs else None
 
         # ------ desired movement vector
