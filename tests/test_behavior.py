@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 KIT = Path(os.environ.get('MECHFIGHT_KIT', ROOT.parent/'work'/'mechfight-kit'))
 from survivor import Bot, World
+from tactics import Navigator
 with gzip.open(KIT/'check'/'stream.jsonl.gz','rt') as f:
     HELLO=json.loads(next(f)); BASE=json.loads(next(f))
 HELLO['map']['dir']=str(KIT/'arena')
@@ -19,6 +20,7 @@ class Behaviors(unittest.TestCase):
     def setUpClass(cls):cls.prototype=Bot(HELLO)
     def setUp(self):
         self.b=copy.copy(self.prototype);self.b.world=EmptyWorld();self.b.avoid_loot={}
+        self.b.navigator=Navigator();self.b.motion={}
         self.o=copy.deepcopy(BASE);self.m=self.o['self']
         self.m.update(pos=[0,0,0],vel=[0,0,0],aim=[0,0],in_zone=True,grounded=True,energy=100,hp=1400,max_hp=1400)
         self.m['weapons'][0].update(ammo=12,reload=0,cooldown=0);self.m['weapons'][1]=None

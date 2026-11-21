@@ -7,6 +7,7 @@ import time
 from array import array
 
 import mechfight as mf
+from tactics import Navigator, visibility, select_target, choose_evasion, jump_route
 
 UPG_RANK = {
     "armor": 0, "plating": 1, "nanites": 2, "gun_damage": 3, "gun_rate": 4,
@@ -131,8 +132,8 @@ class World:
         previous_floor = z
         previous_terrain = self.ground(x,y)
         slope_limit = math.tan(math.radians(getattr(self,'max_slope',50)))
-        for sample in range(1, int(maxd*2)+1):
-            d = sample*0.5
+        for sample in range(1, math.ceil(maxd*2)+1):
+            d = min(maxd,sample*0.5)
             if time.perf_counter()>=self.deadline:
                 return max(0,d-0.5)
             px,py = x+dx*d,y+dy*d
@@ -158,8 +159,8 @@ class World:
             return maxd
         x,y,z = pos
         radius = self.mech_radius
-        for sample in range(1,int(maxd*2)+1):
-            distance = sample*0.5
+        for sample in range(1,math.ceil(maxd*2)+1):
+            distance = min(maxd,sample*0.5)
             if time.perf_counter()>=self.deadline:
                 return max(0,distance-0.5)
             px,py = x+dx*distance,y+dy*distance
@@ -255,6 +256,12 @@ class Bot:
         self.previous_move = [0, 0]
         self.grounded = True
         self.cover_threat = None
+        self.navigator = Navigator()
+        self.target_id = None
+        self.motion = {}
+        self.now = 0
+        self.jump_until = -1
+        self.jump_goal = None
 
     def steer(self, pos, desired, zone, urgent):
         x, y, z = pos
@@ -298,8 +305,27 @@ class Bot:
         vertical = v[2]*flight
         # A rising/falling target is predicted with gravity over the bullet flight.
         if abs(v[2]) > 0.5:
-            vertical -= 0.5*self.cfg['mech']['gravity']*flight*flight
-        return [p[0]+v[0]*flight, p[1]+v[1]*flight, p[2]+4.5*scale+vertical]
+            acceleration = self.motion.get(enemy['id'],{}).get('az',-self.cfg['mech']['gravity'])
+            vertical += 0.5*acceleration*flight*flight
+        px,py = p[0]+v[0]*flight,p[1]+v[1]*flight
+        floor = self.world.ground(px,py)
+        return [px,py,max(floor,p[2]+vertical)+4.5*scale]
+
+    def swap_slot(self, me, kind, radius):
+        if any(w and w.get('charge',0)>0 for w in me['weapons']):
+            return None
+        desired = 'lightning' if radius<90 else 'laser'
+        if kind!=desired:
+            return None
+        return next((i for i,w in enumerate(me['weapons']) if w and w['kind'] not in ('gun',kind)),None)
+
+    def safe_objective(self, obs, point, extra=0):
+        zone,me = obs['zone'],obs['self']
+        travel = math.dist(me['pos'][:2],point[:2])/max(1,me['stats'].get('walk_speed',11.7))
+        if math.dist(point[:2],zone['center'])>zone['radius']-8:
+            return False
+        return (obs['t']+travel+extra+8<zone['shrink_start'] or
+                math.dist(point[:2],zone['next_center'])<zone['next_radius']-8)
 
     def aim_at(self, origin, point):
         dx, dy, dz = (point[i]-origin[i] for i in range(3))
@@ -322,13 +348,16 @@ class Bot:
             for item in items:
                 px,py,pz = item['pos']
                 distance = math.hypot(px-x,py-y)
-                if distance > 55 or abs(pz-z) >= 4 or self.avoid_loot.get(item['id'],-1)>obs['t']:
+                if distance > 55 or self.avoid_loot.get(item['id'],-1)>obs['t']:
+                    continue
+                if abs(pz-z)>=4 and jump_route(self.world,me,item['pos'],self.cfg) is None:
                     continue
                 if math.hypot(px-obs['zone']['center'][0],py-obs['zone']['center'][1]) > obs['zone']['radius']-5:
                     continue
-                if kind == 'weapon' and (item['kind'] not in ('laser','lightning') or item['kind'] in held or all(me['weapons'])):
+                if not self.safe_objective(obs,item['pos']):
                     continue
-                if not self.world.los((x,y,z+2),(px,py,pz+2)):
+                if kind == 'weapon' and (item['kind'] not in ('laser','lightning') or item['kind'] in held or
+                        (all(me['weapons']) and self.swap_slot(me,item['kind'],obs['zone']['radius']) is None)):
                     continue
                 price = distance + (0 if kind=='cube' else 10 if item['kind']=='lightning' else 15)
                 if item['id']==self.loot_id:
@@ -346,7 +375,9 @@ class Bot:
 
     def act(self, obs):
         self.world.deadline = time.perf_counter()+0.020
+        decision_deadline = self.world.deadline
         me, now = obs['self'], obs['t']
+        self.now = now
         x,y,z = me['pos']
         stats = me['stats']
         self.world.mech_radius = stats.get('radius',2.5)
@@ -362,6 +393,14 @@ class Bot:
                 action['pick'] = min(range(len(choices)),key=lambda i:UPG_RANK.get(choices[i]['id'],500))
         enemies = sorted((e for e in obs['mechs'] if e['kind']=='mech' and e.get('hp',1)>0),
                          key=lambda e:math.dist(e['pos'][:2],(x,y)))
+        history = {}
+        for e in enemies:
+            old = self.motion.get(e['id'])
+            az = -self.cfg['mech']['gravity']
+            if old and .04<now-old['t']<.4:
+                az = max(-self.cfg['mech']['gravity'],min(50,(e['vel'][2]-old['vz'])/(now-old['t'])))
+            history[e['id']] = dict(t=now,vz=e['vel'][2],az=az)
+        self.motion = history
         for event in obs['events']:
             if event['type']=='damaged' and event.get('bearing') is not None:
                 self.source,self.source_until = event['bearing'],now+2.5
@@ -397,11 +436,13 @@ class Bot:
         if urgent or distance>max(1,radius*0.65):
             want = [(center[0]-x)/max(distance,0.01),(center[1]-y)/max(distance,0.01)]
         threat = enemies[0] if enemies else None
+        reloading = any(w and w['kind']=='gun' and (w.get('reload',0)>0 or w.get('ammo',0)==0) for w in weapons)
         hp_frac = me['hp']/max(1,me['max_hp'])
+        self.world.deadline = min(decision_deadline,time.perf_counter()+.006)
         if threat and not urgent:
             dx,dy = threat['pos'][0]-x,threat['pos'][1]-y
             d = max(0.01,math.hypot(dx,dy))
-            radial = -1.0 if d<55 or hp_frac<0.4 or len(enemies)>1 else 0.0
+            radial = -1.0 if d<55 or hp_frac<0.4 or len(enemies)>1 or reloading else 0.0
             want[0] += -self.side*dy/d + radial*dx/d
             want[1] += self.side*dx/d + radial*dy/d
             # Stay mobile while choosing actual geometry that screens opponents.
@@ -412,7 +453,7 @@ class Bot:
             if self.cover_goal:
                 nx,ny = self.cover_goal
                 point = (nx,ny,z+stats.get('muzzle_height',7))
-                exposed = any(self.world.los((e['pos'][0],e['pos'][1],e['pos'][2]+7),point) for e in enemies[:2])
+                exposed = any(visibility(self.world,(e['pos'][0],e['pos'][1],e['pos'][2]+7),point) is not False for e in enemies)
                 if flanked or exposed or math.dist((nx,ny),zone['center'])>zone['radius']-margin:
                     self.cover_goal = None
                     self.cover_until = -1
@@ -434,8 +475,11 @@ class Bot:
                     if math.dist((nx,ny),zone['center'])>zone['radius']-margin:
                         continue
                     ground = self.world.ground(nx,ny)
-                    screened = sum(not self.world.los((e['pos'][0],e['pos'][1],e['pos'][2]+7),(nx,ny,ground+7)) for e in enemies[:2])
-                    score = screened*3 + reach/14 - abs(offset)*0.1
+                    views = [visibility(self.world,(e['pos'][0],e['pos'][1],e['pos'][2]+7),(nx,ny,ground+7)) for e in enemies]
+                    if any(v is None for v in views):
+                        break
+                    screened = sum(v is False for v in views)
+                    score = screened*3 - (len(enemies)-screened)*4 + reach/14 - abs(offset)*0.1
                     if screened and score>best:
                         best,self.cover_goal = score,(nx,ny)
             if self.cover_goal:
@@ -445,47 +489,35 @@ class Bot:
                     want = [dx/d,dy/d]
         elif not threat:
             self.cover_goal = None
-        dodge = False
-        for pr in obs['projectiles']:
-            rx,ry = pr['pos'][0]-x,pr['pos'][1]-y
-            vx,vy = pr['vel'][0]-me['vel'][0],pr['vel'][1]-me['vel'][1]
-            v2 = vx*vx+vy*vy
-            mortar = pr['kind']=='mortar'
-            if mortar:
-                gravity = self.cfg['weapons']['mortar']['gravity']
-                height = pr['pos'][2]-z
-                vz = pr['vel'][2]
-                root = vz*vz+2*gravity*max(0,height)
-                eta = (vz+math.sqrt(root))/gravity
-                splash = self.cfg['weapons']['mortar']['splash_radius']+stats.get('radius',2.5)
-            else:
-                if v2<1:
-                    continue
-                eta = -(rx*vx+ry*vy)/v2
-                splash = stats.get('radius',2.5)+1.5
-            if not 0<eta<1.2:
-                continue
-            cx,cy = rx+vx*eta,ry+vy*eta
-            height = pr['pos'][2]-z+(pr['vel'][2]-me['vel'][2])*eta
-            if not mortar and not -1<height<stats.get('height',9)+1:
-                continue
-            separation = math.hypot(cx,cy)
-            if separation<splash:
-                if separation<0.5:
-                    cx,cy = (-vy,vx) if v2>1 else (1.0,0.0)
-                    separation = max(0.01,math.hypot(cx,cy))
-                if not urgent:
-                    want[0] -= 1.6*cx/separation
-                    want[1] -= 1.6*cy/separation
-                dodge = True
+        self.world.deadline = decision_deadline
+        want,dodge = choose_evasion(me,obs['projectiles'],enemies,want,zone,urgent,self.cfg,self.side)
         danger = bool(enemies or self.source is not None or dodge)
         loot = self.loot(obs,danger,urgent)
+        goal = tuple(center) if urgent or distance>max(1,radius*.65) else None
+        if self.cover_goal and not urgent:
+            goal = self.cover_goal
+        crate = None
         if loot:
             kind,item,d = loot
+            goal = item['pos'][:2]
             if kind=='weapon' and d<self.cfg['loot']['pickup_radius'] and abs(item['pos'][2]-z)<4:
                 action['take'] = item['id']
+                if all(weapons):
+                    action['drop'] = self.swap_slot(me,item['kind'],zone['radius'])
             else:
                 want = [(item['pos'][0]-x)/max(0.01,d),(item['pos'][1]-y)/max(0.01,d)]
+        elif not danger and not urgent:
+            drops = [d for d in obs['drops'] if d.get('lands_in',0)<=0 and
+                     math.dist(me['pos'][:2],d['pos'][:2])<50 and self.safe_objective(obs,d['pos'],d.get('capture_s',4))]
+            if drops:
+                drop = min(drops,key=lambda d:math.dist(me['pos'][:2],d['pos'][:2]))
+                d = math.dist(me['pos'][:2],drop['pos'][:2])
+                goal = drop['pos'][:2] if d>drop.get('radius',8)*.65 else None
+                want = [(drop['pos'][0]-x)/max(1,d),(drop['pos'][1]-y)/max(1,d)] if goal else [0,0]
+            else:
+                crate = next((c for c in obs['crates'] if c.get('hp',0)>0 and
+                              math.dist(me['pos'],c['pos'])<45 and self.safe_objective(obs,c['pos'],4)
+                              and visibility(self.world,(x,y,z+7),(c['pos'][0],c['pos'][1],c['pos'][2]+2)) is True),None)
         if self.source is not None and not threat and not urgent and not loot:
             want[0] -= math.cos(self.source)*0.7
             want[1] -= math.sin(self.source)*0.7
@@ -495,17 +527,40 @@ class Bot:
             self.side = -self.side
             self.stuck = 5
         self.last_pos = (x,y)
+        direct_clear = math.inf
+        if goal and me['grounded'] and not dodge:
+            dx,dy = goal[0]-x,goal[1]-y
+            d = math.hypot(dx,dy)
+            direct_clear = self.world.walk_clear(me['pos'],dx/max(.01,d),dy/max(.01,d),min(10,d))
+            if direct_clear<min(10,d)-.01 or self.navigator.path or self.navigator.frontier:
+                waypoint = self.navigator.route(self.world,me['pos'],goal)
+                if waypoint:
+                    dx,dy = waypoint[0]-x,waypoint[1]-y
+                    length = math.hypot(dx,dy)
+                    want = [dx/max(.01,length),dy/max(.01,length)]
+        self.world.deadline = min(decision_deadline,time.perf_counter()+.005)
         movement = self.steer(me['pos'],want,zone,urgent)
+        self.world.deadline = decision_deadline
+        if self.jump_goal and now<self.jump_until and not me['grounded']:
+            movement = self.jump_goal
+        elif self.jump_goal and now>=self.jump_until:
+            self.jump_goal = None
+        if goal and (self.stuck>=5 or direct_clear<5) and not dodge and not reloading and now>=self.jump_until and not any(w and w.get('charge',0)>0 for w in weapons):
+            jump = jump_route(self.world,me,goal,self.cfg)
+            if jump:
+                movement,duration,_ = jump
+                action['jump'] = True
+                self.jump_goal = movement
+                self.jump_until = now+duration+.1
         self.previous_move = movement
         action['move'] = movement
         # In-air boost causes ascent. Ground boost is used only for urgent escape.
         action['boost'] = bool(me['grounded'] and me['energy']>12 and math.hypot(*movement)>0.3
-                               and (urgent or dodge or (threat and hp_frac<0.4)))
+                               and not action['jump'] and (urgent or dodge or (threat and hp_frac<0.4)))
         origin = [x,y,z+stats.get('muzzle_height',7)]
-        targeting = sorted(enemies,key=lambda e:e['id']!=self.attacker) if self.attacker is not None else enemies
         max_range = max((w['stats'].get('range',0) for w in weapons if w),default=0)
-        target = next((e for e in targeting if math.dist(origin,self.target_point(e))<max_range
-                       and self.world.los(origin,self.target_point(e))),None)
+        target = select_target(enemies,origin,self.world,max_range,self.target_id,self.attacker)
+        self.target_id = target['id'] if target else None
         aim = [me['aim'][0],me['aim'][1]]
         if target:
             gun = next((w for w in weapons if w and w['kind']=='gun'),None)
@@ -518,7 +573,9 @@ class Bot:
             direct = self.target_point(target)
             aim = self.aim_at(origin,gun_point)
             laser = next((w for w in weapons if w and w['kind']=='laser'),None)
-            laser_active = laser and not urgent and (laser.get('charge',0)>0 or laser.get('cooldown',0)<=0)
+            gun_ready = gun and gun.get('ammo',0)>0 and gun.get('reload',0)<=0 and gun.get('cooldown',0)<=.05
+            laser_active = laser and not urgent and (laser.get('charge',0)>0 or
+                           (laser.get('cooldown',0)<=0 and (not gun_ready or math.dist(origin,direct)>100)))
             if laser_active:
                 aim = self.aim_at(origin,direct)
             for slot,weapon in enumerate(weapons):
@@ -533,7 +590,8 @@ class Bot:
                     action['fire'][slot] = bool(weapon.get('ammo',0)>0 and weapon.get('reload',0)<=0 and weapon.get('cooldown',0)<=0.05
                         and d<=spec['range'] and clear and self.aligned(me['aim'],desired,d))
                 elif kind=='lightning':
-                    action['fire'][slot] = bool(d<=spec['range'] and clear and me['energy']>=spec['energy']
+                    reserve = 15 if urgent or dodge or hp_frac<.4 else 0
+                    action['fire'][slot] = bool(d<=spec['range'] and clear and me['energy']>=spec['energy']+reserve and weapon.get('cooldown',0)<=.05
                         and abs(wrap(me['aim'][0]-desired[0]))<math.radians(spec['cone_deg'])/2)
                 elif kind=='laser':
                     charge = weapon.get('charge',0)
@@ -544,7 +602,7 @@ class Bot:
                     elif charge>0:
                         action['fire'][slot] = not (aligned and clear and charge>=spec['charge']*0.9)
                     else:
-                        action['fire'][slot] = bool(weapon.get('cooldown',0)<=0 and d<=spec['range'] and clear
+                        action['fire'][slot] = bool(laser_active and weapon.get('cooldown',0)<=0 and d<=spec['range'] and clear
                                                    and self.aligned(me['aim'],desired,d,4,4))
         else:
             aim[0] = self.source if self.source is not None else wrap(aim[0]+0.35)
@@ -558,6 +616,13 @@ class Bot:
                         action['fire'][slot] = bool(not urgent and abs(me['aim'][1]-aim[1])>0.08)
         aim[1] = max(stats.get('min_pitch',-0.7),min(stats.get('max_pitch',1.3),aim[1]))
         action['aim'] = aim
+        if crate and not target:
+            point = [crate['pos'][0],crate['pos'][1],crate['pos'][2]+2]
+            action['aim'] = self.aim_at(origin,point)
+            for slot,weapon in enumerate(weapons):
+                if weapon and weapon['kind']=='gun':
+                    action['fire'][slot] = bool(weapon.get('ammo',0)>0 and weapon.get('reload',0)<=0 and weapon.get('cooldown',0)<=.05
+                        and self.aligned(me['aim'],action['aim'],math.dist(origin,point),1.5,1.5))
         for weapon in weapons:
             if weapon and weapon['kind']=='gun' and weapon.get('reload',0)<=0:
                 if weapon.get('ammo',0)==0 or (not danger and weapon['ammo']<weapon['stats']['mag']*0.6):
