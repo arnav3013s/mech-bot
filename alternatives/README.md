@@ -1,0 +1,1 @@
+This directory preserves the alternative survivor.py from remote commit b323b3c exactly as fetched. The active Docker entrypoint uses the root survivor.py from the tested tactical update 4d1fb2f. The alternative is not included in the Docker image. Both versions remain in Git history.
