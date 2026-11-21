@@ -145,6 +145,24 @@ class World:
             d += 2.0
         return maxd
 
+    def cover_score(self, x, y):
+        """How many of 12 directions have a tall building within 20 m (hiding spot quality)."""
+        if not self.ok:
+            return 0
+        g = self.ground(x, y)
+        n = 0
+        for a in range(12):
+            ang = a * math.pi / 6
+            c, s_ = math.cos(ang), math.sin(ang)
+            d = 4.0
+            while d <= 20.0:
+                k = self.idx(x + c * d, y + s_ * d)
+                if k >= 0 and self.top[k] > g + 9.0:
+                    n += 1
+                    break
+                d += 2.0
+        return n
+
     def los(self, a, b):
         """Rough line of sight for shots: building cells whose top is above the line block it."""
         if not self.ok:
@@ -165,7 +183,7 @@ class World:
 
 
 class Bot:
-    name = "survivor-py"
+    name = "survivor-py3"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -184,6 +202,9 @@ class Bot:
         self.hit_until = -1
         self.cmd_move = False
         self.laser_hold = False
+        self.cover_key = None
+        self.last_hit_t = -99.0
+        self.cover_pt = None
         mf.log("map ok", self.world.ok)
 
     # ---------------------------------------------------------------- helpers
@@ -194,6 +215,31 @@ class Bot:
         if t >= z["shrink_start"] - 30:
             return z["next_center"], z["next_radius"], cur_c, cur_r
         return cur_c, cur_r, cur_c, cur_r
+
+    def pick_cover(self, x, y, cen, rad, ccen, crad, around_self):
+        w = self.world
+        if around_self:
+            ox, oy, R = x, y, 60.0
+        else:
+            ox, oy, R = cen[0], cen[1], min(0.6 * rad, 90.0)
+        best, bs = None, -1e9
+        for i in range(90):
+            if i == 0:
+                px, py = x, y
+            else:
+                a = self.rng.uniform(0, 2 * math.pi)
+                r = R * math.sqrt(self.rng.random())
+                px, py = ox + r * math.cos(a), oy + r * math.sin(a)
+            if math.hypot(px - cen[0], py - cen[1]) > rad * 0.8:
+                continue
+            if math.hypot(px - ccen[0], py - ccen[1]) > crad - 30:
+                continue
+            if w.ok and w.blocked(px, py):
+                continue
+            sc = w.cover_score(px, py) - math.hypot(px - x, py - y) / 150.0
+            if sc > bs:
+                bs, best = sc, (px, py)
+        return best
 
     def steer(self, x, y, want, t):
         """want: desired world direction (length 0..1). Returns a move vector avoiding walls."""
@@ -246,6 +292,8 @@ class Bot:
 
         # damage bearing memory
         for e in obs["events"]:
+            if e["type"] == "damaged":
+                self.last_hit_t = t
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.hit_bearing = e["bearing"]
                 self.hit_until = t + 2.0
@@ -266,11 +314,34 @@ class Bot:
         dz_c = math.hypot(cen[0] - x, cen[1] - y)
         dcur = math.hypot(ccen[0] - x, ccen[1] - y)
         urgent = (not me["in_zone"]) or dcur > crad - 25
-        if dz_c > rad * 0.6 or urgent:
+        around_self = t < obs["zone"]["shrink_start"] - 30
+        key = (round(cen[0]), round(cen[1]), around_self)
+        if key != self.cover_key:
+            self.cover_key = key
+            self.cover_pt = self.pick_cover(x, y, cen, rad, ccen, crad, around_self)
+        goal = self.cover_pt if self.cover_pt else cen
+        drop_goal = None
+        if not mechs and not (t - self.last_hit_t < 4.0):
+            for dp in obs.get("drops", []):
+                if dp["lands_in"] > 20:
+                    continue
+                if math.hypot(dp["pos"][0] - cen[0], dp["pos"][1] - cen[1]) > rad - 12:
+                    continue
+                if dp["holder"] is not None and dp["holder"] != self.slot:
+                    continue
+                dd = math.hypot(dp["pos"][0] - x, dp["pos"][1] - y)
+                if drop_goal is None or dd < drop_goal[0]:
+                    drop_goal = (dd, dp)
+        if drop_goal is not None:
+            goal = drop_goal[1]["pos"][:2]
+        dg = math.hypot(goal[0] - x, goal[1] - y)
+        if urgent:
             gv = [(cen[0] - x) / (dz_c + 1e-6), (cen[1] - y) / (dz_c + 1e-6)]
-            wgt = 1.0 if (urgent or dz_c > rad * 0.9) else 0.6
-            want[0] += gv[0] * wgt
-            want[1] += gv[1] * wgt
+            want[0] += gv[0]
+            want[1] += gv[1]
+        elif dg > 5.0:
+            want[0] += (goal[0] - x) / dg * 0.8
+            want[1] += (goal[1] - y) / dg * 0.8
 
         fighting = threat is not None and threat["_d"] < 150
         hp_frac = me["hp"] / me["max_hp"]
