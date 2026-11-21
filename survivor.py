@@ -180,7 +180,7 @@ class World:
 
 
 class Bot:
-    name = "survivor-best"
+    name = "survivor-fix"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -199,6 +199,10 @@ class Bot:
         self.hit_until = -1
         self.cmd_move = False
         self.laser_hold = False
+        self.shot_bearing = None      # newest gunfire bearing heard (mechs only)
+        self.shot_t = -99.0
+        self.last_target_yaw = None   # where we last aimed at a mech
+        self.last_target_t = -99.0
         mf.log("map ok", self.world.ok)
 
     # ---------------------------------------------------------------- helpers
@@ -268,6 +272,11 @@ class Bot:
                 self.hit_bearing = e["bearing"]
                 self.hit_until = t + 2.0
 
+        for s in obs.get("sounds", []):
+            if s.get("kind") in ("gun", "laser", "lightning", "mortar") and s.get("age", 9.0) < 1.0:
+                self.shot_bearing = s["bearing"]
+                self.shot_t = t - s["age"]
+
         # ------ targets
         muzzle = [x, y, z + stats.get("muzzle_height", 7)]
         target = None
@@ -292,7 +301,7 @@ class Bot:
             want[0] += gv[0] * wgt
             want[1] += gv[1] * wgt
 
-        fighting = threat is not None and threat["_d"] < 150
+        fighting = threat is not None and threat["_d"] < 150 and me["in_zone"]
         hp_frac = me["hp"] / me["max_hp"]
         if fighting:
             tx, ty = threat["pos"][0] - x, threat["pos"][1] - y
@@ -404,7 +413,7 @@ class Bot:
 
         # stuck detection
         moving_cmd = math.hypot(*want) > 0.2
-        if self.last_pos is not None and moving_cmd:
+        if self.last_pos is not None and moving_cmd and not fighting:
             moved = math.hypot(x - self.last_pos[0], y - self.last_pos[1])
             if moved < 0.4:
                 self.stuck += 1
@@ -418,8 +427,7 @@ class Bot:
             self.escape_until = t + 1.2
             self.escape_dir = self.rng.uniform(-math.pi, math.pi)
             self.stuck = 0
-        if self.escape_until > t:
-            jump = True
+            jump = True  # one jump when the escape starts, not every tick
 
         mv = self.steer(x, y, want, t) if moving_cmd else [0.0, 0.0]
         act["move"] = mv
@@ -444,6 +452,8 @@ class Bot:
                 dist = math.dist(aimp[:2], (x, y)) + 1e-6
                 tt = dist / spdb + 0.05
             yaw_cmd = math.atan2(aimp[1] - y, aimp[0] - x)
+            self.last_target_yaw = yaw_cmd
+            self.last_target_t = t
             pit_cmd = max(-0.7, min(1.3, math.atan2(aimp[2] - muzzle[2], dist)))
             err = abs(wrap(yaw_cmd - me["aim"][0]))
             tol = 2.2 / dist + 0.02
@@ -469,9 +479,13 @@ class Bot:
             if mechs:  # tracked but no LOS: keep facing it
                 tp = mechs[0]["pos"]
                 yaw_cmd = math.atan2(tp[1] - y, tp[0] - x)
+            elif self.shot_bearing is not None and t - self.shot_t < 2.0:
+                yaw_cmd = self.shot_bearing  # turn toward the gunfire we heard
             w1 = me["weapons"][1]
             if w1 and w1["kind"] == "laser" and w1.get("charge", 0) > 0:
-                fire[1] = False
+                fire[1] = False  # release, but aim where the enemy was, not at empty ground
+                if self.last_target_yaw is not None and t - self.last_target_t < 1.0:
+                    yaw_cmd = self.last_target_yaw
         act["aim"] = [yaw_cmd, pit_cmd]
         act["fire"] = fire
         gun = me["weapons"][0]
